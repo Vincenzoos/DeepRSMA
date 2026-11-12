@@ -380,7 +380,12 @@ def _summary(results: list[dict[str, Any]], strategy: str, output_root: Path) ->
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--strategy", choices=_STRATEGIES, default="unseen_pair")
+    parser.add_argument(
+        "--split-strategy",
+        choices=_STRATEGIES,
+        default="unseen_pair",
+        help="AptaBench split strategy (default: unseen_pair)",
+    )
     parser.add_argument("--all-strategies", action="store_true")
     parser.add_argument("--fold-id", type=int, help="run one zero-based fold")
     parser.add_argument("--epochs", type=int, default=1500)
@@ -437,7 +442,7 @@ def main(argv: list[str] | None = None) -> int:
 
     output_root = args.output_root.expanduser().resolve()
     embedding_dir = args.embedding_dir.expanduser().resolve()
-    strategies = _STRATEGIES if args.all_strategies else (args.strategy,)
+    strategies = _STRATEGIES if args.all_strategies else (args.split_strategy,)
     results: list[dict[str, Any]] = []
     for strategy in strategies:
         fold_ids = (args.fold_id,) if args.fold_id is not None else (0, 1, 2, 3, 4)
