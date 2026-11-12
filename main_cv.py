@@ -5,16 +5,14 @@ from model import RNA_feature_extraction, GNN_molecule, mole_seq_model, cross_at
 from torch_geometric.loader import DataLoader
 import torch.optim as optim
 from scipy.stats import pearsonr,spearmanr
-from torch.autograd import Variable
 import numpy as np
 import os
 import torch.nn as nn
 from sklearn.model_selection import RepeatedStratifiedKFold
 from sklearn.preprocessing import KBinsDiscretizer
-from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.metrics import mean_squared_error
 import random
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
 # hyperparameter
@@ -25,24 +23,18 @@ seed_dataset = 2
 seed = 1
 LR = 5e-4
 
-# All RNA or 6 RNA subtype: All_sf; Aptamers; miRNA; Repeats; Ribosomal; Riboswitch; Viral_RNA;
-RNA_type = 'All_sf'
-rna_dataset = RNA_dataset(RNA_type)
-molecule_dataset = Molecule_dataset(RNA_type)
-
 # set random seed
 def set_seed(seed):
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)  # if you are using multi-GPU.
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)  # if you are using multi-GPU.
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
     torch.set_printoptions(precision=20)
-set_seed(seed)
-
 # combine two pyg dataset
 class CustomDualDataset(Dataset):
     def __init__(self, dataset1, dataset2):
@@ -77,10 +69,12 @@ class regressor_stratified_cv:
 
 # DeepRSMA architecture
 class DeepRSMA(nn.Module):
-    def __init__(self):
+    def __init__(self, rna_embedding_dim=640):
         super(DeepRSMA, self).__init__()
         # RNA graph + seq
-        self.rna_graph_model = RNA_feature_extraction(hidden_dim)
+        self.rna_graph_model = RNA_feature_extraction(
+            hidden_dim, embedding_dim=rna_embedding_dim
+        )
         
         # Mole graph
         self.mole_graph_model = GNN_molecule(hidden_dim)
@@ -159,86 +153,83 @@ class DeepRSMA(nn.Module):
         return out
 
 
-# 10 fold
-kf = regressor_stratified_cv(n_splits=10, n_repeats=1, random_state=seed_dataset, group_count=5, strategy='uniform')
+def main():
+    """Run the upstream stratified RNA--molecule cross-validation experiment."""
 
+    # All RNA or 6 RNA subtype: All_sf; Aptamers; miRNA; Repeats; Ribosomal; Riboswitch; Viral_RNA;
+    RNA_type = 'All_sf'
+    rna_dataset = RNA_dataset(RNA_type)
+    molecule_dataset = Molecule_dataset(RNA_type)
+    set_seed(seed)
 
-fold = 0
-p_list = []
-m_list = []
-s_list = []
-r_list = []
-for train_id,test_id in kf.split(rna_dataset, rna_dataset.y):
-    max_p = -1
-    max_s = -1
-    max_rmse = 0
-    fold = fold + 1
-
-    print("Fold", fold)
-    
-    # Combine RNA Dataset and Mole Dataset
-    train_dataset = CustomDualDataset(rna_dataset[train_id], molecule_dataset[train_id])
-    test_dataset = CustomDualDataset(rna_dataset[test_id], molecule_dataset[test_id])
-
-    
-    train_loader = DataLoader(
-        train_dataset, batch_size=BATCH_SIZE, num_workers=1, drop_last=False, shuffle=False
+    kf = regressor_stratified_cv(
+        n_splits=10,
+        n_repeats=1,
+        random_state=seed_dataset,
+        group_count=5,
+        strategy='uniform',
     )
+    p_list = []
+    s_list = []
+    r_list = []
+    for fold, (train_id, test_id) in enumerate(kf.split(rna_dataset, rna_dataset.y), start=1):
+        max_p = -1
+        max_s = -1
+        max_rmse = 0
+        print("Fold", fold)
 
-    test_loader = DataLoader(
-        test_dataset, batch_size=BATCH_SIZE, num_workers=1, drop_last=False, shuffle=False
-    )
-    
-    
-    model = DeepRSMA().to(device)
-    optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=1e-7)
-    optimal_loss = 1e10
-    loss_fct = torch.nn.MSELoss()
+        train_dataset = CustomDualDataset(rna_dataset[train_id], molecule_dataset[train_id])
+        test_dataset = CustomDualDataset(rna_dataset[test_id], molecule_dataset[test_id])
+        train_loader = DataLoader(
+            train_dataset, batch_size=BATCH_SIZE, num_workers=1, drop_last=False, shuffle=False
+        )
+        test_loader = DataLoader(
+            test_dataset, batch_size=BATCH_SIZE, num_workers=1, drop_last=False, shuffle=False
+        )
 
-    for epo in range(EPOCH):
-        # train
-        train_loss = 0
-        for step, (batch_rna,batch_mole) in enumerate(train_loader):
-            optimizer.zero_grad()
-            pre = model(batch_rna.to(device), batch_mole.to(device))
-            loss = loss_fct(pre.squeeze(dim=1), batch_rna.y)
-            loss.backward()
-            optimizer.step()
-            train_loss = train_loss + loss
-        # test
-        with torch.set_grad_enabled(False):
-            test_loss = 0
+        model = DeepRSMA().to(device)
+        optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=1e-7)
+        loss_fct = torch.nn.MSELoss()
+        for epo in range(EPOCH):
+            model.train()
+            for batch_rna, batch_mole in train_loader:
+                optimizer.zero_grad()
+                pre = model(batch_rna.to(device), batch_mole.to(device))
+                loss = loss_fct(pre.squeeze(dim=1), batch_rna.y)
+                loss.backward()
+                optimizer.step()
+
             model.eval()
             y_label = []
             y_pred = []
-            for step, (batch_rna_test,batch_mole_test) in enumerate(test_loader):
+            with torch.inference_mode():
+                for batch_rna_test, batch_mole_test in test_loader:
+                    score = model(batch_rna_test.to(device), batch_mole_test.to(device))
+                    y_label.extend(batch_rna_test.y.detach().cpu().reshape(-1).tolist())
+                    y_pred.extend(score.detach().cpu().reshape(-1).tolist())
 
-                label = Variable(torch.from_numpy(np.array(batch_rna_test.y))).float()
-                score = model(batch_rna_test.to(device), batch_mole_test.to(device))
-                n = torch.squeeze(score, 1)
-                logits = torch.squeeze(score).detach().cpu().numpy()
-                label_ids = label.to('cpu').numpy()
-                loss_t = loss_fct(n.cpu(), label)
-                y_label = y_label + label_ids.flatten().tolist()
-                y_pred = y_pred + logits.flatten().tolist()
-                test_loss = test_loss + loss_t
-            
-        model.train()
-        p = pearsonr(y_label, y_pred)
-        s = spearmanr(y_label, y_pred)
-        rmse = np.sqrt(mean_squared_error(y_label, y_pred))
-        if max_p < p[0]:
-            print('epo:',epo, 'pcc:',p[0],'scc: ',s[0], 'rmse:',rmse)
-            max_p = p[0]
-            max_s = s[0]
-            max_rmse =rmse
-            torch.save(model.state_dict(), 'save/' + 'model_'+str(RNA_type)+str(seed_dataset)+'_'+str(fold)+'_'+str(seed)+'.pth')
-    
-    p_list.append(max_p)
-    r_list.append(max_rmse)
-    s_list.append(max_s)
+            p = pearsonr(y_label, y_pred)
+            s = spearmanr(y_label, y_pred)
+            rmse = np.sqrt(mean_squared_error(y_label, y_pred))
+            if max_p < p[0]:
+                print('epo:', epo, 'pcc:', p[0], 'scc: ', s[0], 'rmse:', rmse)
+                max_p = p[0]
+                max_s = s[0]
+                max_rmse = rmse
+                checkpoint_name = (
+                    'model_' + str(RNA_type) + str(seed_dataset) + '_' + str(fold) + '_' + str(seed)
+                    + '.pth'
+                )
+                torch.save(model.state_dict(), os.path.join('save', checkpoint_name))
 
-    print('p:', np.mean(p_list))
-    print('s:', np.mean(s_list))
-    print('rmse:', np.mean(r_list))
+        p_list.append(max_p)
+        r_list.append(max_rmse)
+        s_list.append(max_s)
+        print('p:', np.mean(p_list))
+        print('s:', np.mean(s_list))
+        print('rmse:', np.mean(r_list))
+
+
+if __name__ == "__main__":
+    main()
 

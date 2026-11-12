@@ -40,7 +40,7 @@ class CNN(torch.nn.Module):
 
 
 class RNA_feature_extraction(nn.Module):
-    def __init__(self, hidden_size,input_dim=128, hidden_dim=256):
+    def __init__(self, hidden_size,input_dim=128, hidden_dim=256, embedding_dim=640):
         super(RNA_feature_extraction, self).__init__()
         
         # RNA Seq
@@ -60,7 +60,8 @@ class RNA_feature_extraction(nn.Module):
         self.line1 = nn.Linear(128, hidden_size)
         self.hidden_size = hidden_size
         
-        self.line_emb = nn.Linear(640, 128)
+        # RNA-FM supplies 640 features upstream; the DNA adapter supplies 1024 GB.DNA features.
+        self.line_emb = nn.Linear(embedding_dim, 128)
         self.line_g= nn.Linear(128, 128)
         self.dropout = nn.Dropout(0.2)
         
