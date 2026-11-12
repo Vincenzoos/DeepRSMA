@@ -129,7 +129,7 @@ def _validate_embedding_store(split: Any, embedding_dir: Path) -> dict[str, Any]
     if not manifest_path.is_file():
         raise AptaBenchInputError(
             f"GB.DNA embeddings are not materialized under {embedding_dir}; "
-            "run main_aptabench_cv.py --prepare-dna-embeddings first"
+            "run main_aptabench_cv.py --dataset-dir PATH --prepare-dna-embeddings first"
         )
     manifest = _read_json(manifest_path)
     clean_csv = split.processed_root / "clean.csv"
@@ -197,13 +197,26 @@ class AptaBenchAdapter:
     partition while avoiding target imputation.
     """
 
-    def __init__(self, strategy: str, embedding_dir: str | Path) -> None:
+    def __init__(
+        self,
+        strategy: str,
+        dataset_dir: str | Path,
+        embedding_dir: str | Path,
+    ) -> None:
         if strategy not in _SPLIT_ORDER:
             raise ValueError(f"unsupported AptaBench split strategy {strategy!r}")
-        split_dir = (
-            _THESIS_ROOT / "data" / "aptabench" / "processed" / "cross_validation" / strategy
-        )
+        split_dir = Path(dataset_dir).expanduser().resolve()
         self.split = read_split(split_dir)
+        if self.split.split_mode != "cross_validation":
+            raise AptaBenchInputError(
+                f"DeepRSMA requires a cross-validation dataset directory, got "
+                f"{self.split.split_mode!r}"
+            )
+        if self.split.split_strategy != strategy:
+            raise AptaBenchInputError(
+                f"dataset directory strategy {self.split.split_strategy!r} does not match "
+                f"--split-strategy {strategy!r}"
+            )
         if self.split.fold_ids != (0, 1, 2, 3, 4):
             raise AptaBenchInputError(
                 f"DeepRSMA requires the existing five folds; got {self.split.fold_ids}"
@@ -420,6 +433,7 @@ def _hidden_states(output: Any) -> Tensor:
 def materialize_gbdna_embeddings(
     output_dir: str | Path,
     *,
+    dataset_dir: str | Path,
     batch_size: int = 8,
     device: str | torch.device = "cpu",
     overwrite: bool = False,
@@ -435,14 +449,16 @@ def materialize_gbdna_embeddings(
 
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
-    split = read_split(
-        _THESIS_ROOT
-        / "data"
-        / "aptabench"
-        / "processed"
-        / "cross_validation"
-        / "unseen_pair"
-    )
+    split = read_split(dataset_dir)
+    if split.split_mode != "cross_validation":
+        raise AptaBenchInputError(
+            f"GB.DNA embedding preparation requires a cross-validation split, "
+            f"got {split.split_mode!r}"
+        )
+    if split.split_strategy not in _SPLIT_ORDER:
+        raise AptaBenchInputError(
+            f"unsupported AptaBench split strategy {split.split_strategy!r}"
+        )
     destination = Path(output_dir).expanduser().resolve()
     clean_csv = split.processed_root / "clean.csv"
     expected = _embedding_manifest_payload(clean_csv)

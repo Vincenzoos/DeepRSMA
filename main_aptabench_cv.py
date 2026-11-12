@@ -205,6 +205,7 @@ def run_fold(
     *,
     strategy: str,
     fold_id: int,
+    dataset_dir: Path,
     embedding_dir: Path,
     output_root: Path,
     device: torch.device,
@@ -219,7 +220,7 @@ def run_fold(
     seed = _BASE_SEED + fold_id
     upstream_cv.set_seed(seed)
     upstream_cv.device = device
-    adapter = AptaBenchAdapter(strategy, embedding_dir)
+    adapter = AptaBenchAdapter(strategy, dataset_dir, embedding_dir)
     partition, datasets = adapter.datasets_for_fold(
         fold_id,
         limit_per_partition=smoke_examples if smoke else None,
@@ -233,6 +234,13 @@ def run_fold(
     test_rows = partition.test[:smoke_examples] if smoke else partition.test
     config = {
         "dataset": "AptaBench",
+        "dataset_dir": str(adapter.split.split_dir),
+        "dataset_identity": {
+            "split_mode": adapter.split.split_mode,
+            "split_strategy": adapter.split.split_strategy,
+            "source_fingerprint": adapter.split.source_fingerprint,
+            "fold_ids": list(adapter.split.fold_ids),
+        },
         "split_mode": "cross_validation",
         "split_strategy": strategy,
         "fold_id": fold_id,
@@ -242,6 +250,8 @@ def run_fold(
         "batch_size": batch_size,
         "num_workers": resolved_workers,
         "smoke_run": smoke,
+        "smoke_examples": smoke_examples,
+        "embedding_dir": str(embedding_dir.expanduser().resolve()),
         "source_url": UPSTREAM_URL,
         "source_commit": UPSTREAM_COMMIT,
         "dna_structure_input": "Thesis A ViennaRNA DNA BPP graph; adjacency only",
@@ -388,6 +398,20 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--all-strategies", action="store_true")
     parser.add_argument("--fold-id", type=int, help="run one zero-based fold")
+    dataset_group = parser.add_mutually_exclusive_group()
+    dataset_group.add_argument(
+        "--dataset-dir",
+        type=Path,
+        help="one processed cross-validation strategy directory; required for one strategy",
+    )
+    dataset_group.add_argument(
+        "--dataset-root",
+        type=Path,
+        help=(
+            "processed cross_validation directory containing strategy folders; required "
+            "with --all-strategies"
+        ),
+    )
     parser.add_argument("--epochs", type=int, default=1500)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--num-workers", type=int, default=1)
@@ -413,6 +437,13 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("smoke-examples must be at least 2")
     if args.all_strategies and args.fold_id is not None:
         raise SystemExit("--fold-id cannot be combined with --all-strategies")
+    if args.all_strategies:
+        if args.dataset_root is None:
+            raise SystemExit("--all-strategies requires --dataset-root")
+    elif args.dataset_dir is None:
+        raise SystemExit("a single-strategy run requires --dataset-dir")
+    if args.dataset_root is not None and not args.all_strategies:
+        raise SystemExit("--dataset-root requires --all-strategies")
 
     device = (
         torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -423,8 +454,11 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"requested device {device} is not available")
 
     if args.prepare_dna_embeddings:
+        if args.all_strategies:
+            raise SystemExit("--prepare-dna-embeddings requires --dataset-dir for one strategy")
         manifest = materialize_gbdna_embeddings(
             args.embedding_dir,
+            dataset_dir=args.dataset_dir,
             device=device,
             overwrite=args.overwrite_embeddings,
         )
@@ -442,7 +476,19 @@ def main(argv: list[str] | None = None) -> int:
 
     output_root = args.output_root.expanduser().resolve()
     embedding_dir = args.embedding_dir.expanduser().resolve()
-    strategies = _STRATEGIES if args.all_strategies else (args.split_strategy,)
+    if args.all_strategies:
+        strategies = _STRATEGIES
+        dataset_dirs = {
+            strategy: args.dataset_root.expanduser().resolve() / strategy
+            for strategy in strategies
+        }
+        missing_dirs = [path for path in dataset_dirs.values() if not path.is_dir()]
+        if missing_dirs:
+            missing = ", ".join(str(path) for path in missing_dirs)
+            raise SystemExit(f"--dataset-root is missing strategy directories: {missing}")
+    else:
+        strategies = (args.split_strategy,)
+        dataset_dirs = {args.split_strategy: args.dataset_dir.expanduser().resolve()}
     results: list[dict[str, Any]] = []
     for strategy in strategies:
         fold_ids = (args.fold_id,) if args.fold_id is not None else (0, 1, 2, 3, 4)
@@ -451,6 +497,7 @@ def main(argv: list[str] | None = None) -> int:
             result = run_fold(
                 strategy=strategy,
                 fold_id=fold_id,
+                dataset_dir=dataset_dirs[strategy],
                 embedding_dir=embedding_dir,
                 output_root=output_root,
                 device=device,
